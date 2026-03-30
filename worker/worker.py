@@ -45,6 +45,7 @@ class Worker:
 
         # Lock
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
 
         log_event(self.logger, self.clock.tick(), "INIT",
                   f"Worker '{worker_id}' inicializado | "
@@ -237,7 +238,8 @@ class Worker:
         """Envia mensagem TCP com prefixo de tamanho."""
         encoded = data.encode('utf-8')
         length = len(encoded)
-        self.conn.sendall(struct.pack('!I', length) + encoded)
+        with self._send_lock:
+            self.conn.sendall(struct.pack('!I', length) + encoded)
 
     def _recv_message(self) -> str:
         """Recebe mensagem TCP com prefixo de tamanho."""

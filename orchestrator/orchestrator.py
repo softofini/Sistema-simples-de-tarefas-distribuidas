@@ -54,6 +54,9 @@ class Orchestrator:
         self._tasks_lock = threading.Lock()
         self._workers_lock = threading.Lock()
 
+        # Envio TCP para workers ocorre em multiplas threads e precisa ser serializado
+        self._worker_send_locks = {}
+
         log_event(self.logger, self.clock.tick(), "INIT",
                   f"Orquestrador principal inicializado em {host}:{client_port}")
 
@@ -333,6 +336,7 @@ class Orchestrator:
                             'last_heartbeat': time.time(),
                             'active': True
                         }
+                        self._worker_send_locks[worker_id] = threading.Lock()
                     log_event(self.logger, self.clock.tick(), "WORKER_REGISTERED",
                               f"Worker '{worker_id}' registrado de {addr}")
 
@@ -343,7 +347,7 @@ class Orchestrator:
                         payload={"success": True, "message": "Worker registrado com sucesso"},
                         lamport_time=self.clock.send_event()
                     )
-                    self._send_message(conn, response.to_json())
+                    self._send_worker_message(worker_id, conn, response.to_json())
 
                     # Distribuir tarefas pendentes
                     self._distribute_pending_tasks()
@@ -360,7 +364,7 @@ class Orchestrator:
                             payload={},
                             lamport_time=self.clock.send_event()
                         )
-                        self._send_message(conn, response.to_json())
+                        self._send_worker_message(worker_id, conn, response.to_json())
 
                 elif msg.msg_type == MessageType.TASK_COMPLETE.value:
                     task_id = msg.payload.get("task_id")
@@ -400,10 +404,16 @@ class Orchestrator:
 
     def _handle_task_failure(self, worker_id, task_id, reason):
         """Processa falha em tarefa e reatribui."""
+        task_to_retry = None
+
         with self._tasks_lock:
             if task_id in self.tasks:
                 self.tasks[task_id].status = TaskStatus.FAILED.value
                 self.tasks[task_id].retries += 1
+                if self.tasks[task_id].retries < 3:
+                    self.tasks[task_id].status = TaskStatus.REASSIGNED.value
+                    self.tasks[task_id].assigned_worker = None
+                    task_to_retry = self.tasks[task_id]
 
         with self._workers_lock:
             if worker_id in self.workers:
@@ -412,15 +422,10 @@ class Orchestrator:
         log_event(self.logger, self.clock.tick(), "TASK_FAILED",
                   f"Tarefa '{task_id}' falhou no worker '{worker_id}' | Motivo: {reason}")
 
-        # Reatribuir a tarefa
-        with self._tasks_lock:
-            task = self.tasks.get(task_id)
-            if task and task.retries < 3:
-                task.status = TaskStatus.REASSIGNED.value
-                task.assigned_worker = None
-                log_event(self.logger, self.clock.tick(), "TASK_REASSIGN",
-                          f"Reatribuindo tarefa '{task_id}' (tentativa {task.retries})")
-                self._distribute_task(task)
+        if task_to_retry:
+            log_event(self.logger, self.clock.tick(), "TASK_REASSIGN",
+                      f"Reatribuindo tarefa '{task_id}' (tentativa {task_to_retry.retries})")
+            self._distribute_task(task_to_retry)
 
         self._sync_state_to_backup()
 
@@ -448,6 +453,10 @@ class Orchestrator:
             log_event(self.logger, self.clock.tick(), "TASK_REASSIGN",
                       f"Reatribuindo tarefa '{task.task_id}' (worker '{worker_id}' caiu)")
             self._distribute_task(task)
+
+        with self._workers_lock:
+            if worker_id in self._worker_send_locks:
+                del self._worker_send_locks[worker_id]
 
         self._sync_state_to_backup()
 
@@ -496,7 +505,7 @@ class Orchestrator:
 
         try:
             conn = selected_info['conn']
-            self._send_message(conn, assign_msg.to_json())
+            self._send_worker_message(selected_id, conn, assign_msg.to_json())
             log_event(self.logger, self.clock.get_time(), "TASK_DISTRIBUTED",
                       f"Tarefa '{task.task_id}' distribuída para worker '{selected_id}' (Round Robin)")
             return True
@@ -617,6 +626,18 @@ class Orchestrator:
                       f"Erro ao sincronizar com backup: {e}")
 
     # ==================== COMUNICAÇÃO TCP ====================
+
+    def _send_worker_message(self, worker_id: str, conn: socket.socket, data: str):
+        """Serializa envios para cada socket de worker para evitar corrupcao no stream TCP."""
+        with self._workers_lock:
+            send_lock = self._worker_send_locks.get(worker_id)
+
+        if send_lock is None:
+            self._send_message(conn, data)
+            return
+
+        with send_lock:
+            self._send_message(conn, data)
 
     @staticmethod
     def _send_message(conn: socket.socket, data: str):

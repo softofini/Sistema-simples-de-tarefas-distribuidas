@@ -23,12 +23,15 @@ from utils.logger import setup_logger, log_event
 
 class Client:
     def __init__(self, client_id: str, orchestrator_host='127.0.0.1',
-                 orchestrator_port=5000):
+                 orchestrator_port=5000, fallback_endpoints=None):
         self.client_id = client_id
         self.orchestrator_host = orchestrator_host
         self.orchestrator_port = orchestrator_port
+        self.fallback_endpoints = fallback_endpoints or []
         self.token = None
         self.conn = None
+        self._username = None
+        self._password = None
 
         self.clock = LamportClock(client_id)
         self.logger = setup_logger(client_id)
@@ -36,18 +39,55 @@ class Client:
         log_event(self.logger, self.clock.tick(), "INIT",
                   f"Cliente '{client_id}' inicializado")
 
+    def _do_connect(self, host: str, port: int) -> bool:
+        """Tenta conectar a um endpoint específico."""
+        try:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+            self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.conn.connect((host, port))
+            return True
+        except (ConnectionRefusedError, OSError):
+            return False
+
     def connect(self):
         """Conecta ao orquestrador."""
-        try:
-            self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.conn.connect((self.orchestrator_host, self.orchestrator_port))
+        if self._do_connect(self.orchestrator_host, self.orchestrator_port):
             log_event(self.logger, self.clock.tick(), "CONNECTED",
                       f"Conectado ao orquestrador em {self.orchestrator_host}:{self.orchestrator_port}")
             return True
-        except ConnectionRefusedError:
-            log_event(self.logger, self.clock.tick(), "CONNECTION_FAILED",
-                      "Não foi possível conectar ao orquestrador")
-            return False
+        log_event(self.logger, self.clock.tick(), "CONNECTION_FAILED",
+                  "Não foi possível conectar ao orquestrador")
+        return False
+
+    def _try_reconnect(self, timeout_seconds: int = 20, retry_interval: float = 1.0) -> bool:
+        """Tenta reconectar por alguns segundos para cobrir a janela de failover do backup."""
+        # Remove duplicados preservando ordem
+        endpoints = []
+        for endpoint in [(self.orchestrator_host, self.orchestrator_port)] + self.fallback_endpoints:
+            if endpoint not in endpoints:
+                endpoints.append(endpoint)
+
+        start = time.time()
+        while (time.time() - start) < timeout_seconds:
+            for host, port in endpoints:
+                if self._do_connect(host, port):
+                    self.orchestrator_host = host
+                    self.orchestrator_port = port
+                    log_event(self.logger, self.clock.tick(), "RECONNECTED",
+                              f"Reconectado ao orquestrador em {host}:{port}")
+                    print(f"\n[!] Reconectado ao orquestrador em {host}:{port}")
+                    if self._username and self._password:
+                        return self.authenticate(self._username, self._password)
+                    return True
+            time.sleep(retry_interval)
+
+        log_event(self.logger, self.clock.tick(), "RECONNECT_FAILED",
+                  f"Não foi possível reconectar após {timeout_seconds}s")
+        return False
 
     def disconnect(self):
         """Desconecta do orquestrador."""
@@ -61,6 +101,8 @@ class Client:
         Autentica o cliente no orquestrador.
         Retorna True se a autenticação foi bem-sucedida.
         """
+        self._username = username
+        self._password = password
         msg = Message(
             msg_type=MessageType.AUTH_REQUEST.value,
             sender_id=self.client_id,
@@ -104,11 +146,9 @@ class Client:
             lamport_time=self.clock.send_event(),
             token=self.token
         )
-        self._send_message(msg.to_json())
-
-        data = self._recv_message()
+        data = self._request(msg)
         if not data:
-            return {"success": False, "message": "Sem resposta do orquestrador"}
+            return {"success": False, "message": "Orquestrador inacessível"}
 
         response = Message.from_json(data)
         self.clock.receive_event(response.lamport_time)
@@ -134,11 +174,9 @@ class Client:
             lamport_time=self.clock.send_event(),
             token=self.token
         )
-        self._send_message(msg.to_json())
-
-        data = self._recv_message()
+        data = self._request(msg)
         if not data:
-            return {"success": False, "message": "Sem resposta do orquestrador"}
+            return {"success": False, "message": "Orquestrador inacessível"}
 
         response = Message.from_json(data)
         self.clock.receive_event(response.lamport_time)
@@ -147,10 +185,32 @@ class Client:
 
     # ==================== COMUNICAÇÃO TCP ====================
 
-    def _send_message(self, data: str):
-        encoded = data.encode('utf-8')
-        length = len(encoded)
-        self.conn.sendall(struct.pack('!I', length) + encoded)
+    def _request(self, msg) -> str:
+        """Envia uma mensagem e retorna a resposta bruta, com reconexão automática em caso de falha."""
+        if not self._send_message(msg.to_json()):
+            if not self._try_reconnect():
+                return None
+            msg.token = self.token
+            if not self._send_message(msg.to_json()):
+                return None
+        data = self._recv_message()
+        if data is None:
+            if not self._try_reconnect():
+                return None
+            msg.token = self.token
+            if not self._send_message(msg.to_json()):
+                return None
+            data = self._recv_message()
+        return data
+
+    def _send_message(self, data: str) -> bool:
+        try:
+            encoded = data.encode('utf-8')
+            length = len(encoded)
+            self.conn.sendall(struct.pack('!I', length) + encoded)
+            return True
+        except (OSError, BrokenPipeError, ConnectionResetError):
+            return False
 
     def _recv_message(self) -> str:
         raw_length = self._recv_exact(4)
@@ -182,11 +242,14 @@ def interactive_client():
 
     host = input("\nHost do orquestrador [127.0.0.1]: ").strip() or "127.0.0.1"
     port = input("Porta do orquestrador [5000]: ").strip() or "5000"
+    backup_host = input("Host do orquestrador backup [127.0.0.1]: ").strip() or "127.0.0.1"
+    backup_port = input("Porta do backup [6000]: ").strip() or "6000"
 
     client = Client(
         client_id=f"client_{int(time.time()) % 10000}",
         orchestrator_host=host,
-        orchestrator_port=int(port)
+        orchestrator_port=int(port),
+        fallback_endpoints=[(backup_host, int(backup_port))]
     )
 
     if not client.connect():
