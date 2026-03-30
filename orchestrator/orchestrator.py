@@ -94,6 +94,9 @@ class Orchestrator:
         sync_thread = threading.Thread(target=self._multicast_sync, daemon=True)
         sync_thread.start()
 
+        orchestrator_heartbeat_thread = threading.Thread(target=self._send_orchestrator_heartbeats, daemon=True)
+        orchestrator_heartbeat_thread.start()
+
         log_event(self.logger, self.clock.tick(), "RUNNING", "Todos os serviços do orquestrador estão ativos")
 
         try:
@@ -457,6 +460,13 @@ class Orchestrator:
                 task.lamport_started = self.clock.get_time()
                 if not task.first_started_worker:
                     task.first_started_worker = worker_id
+                # Registrar no histórico de execução
+                task.execution_history.append({
+                    "worker_id": worker_id,
+                    "event": "STARTED",
+                    "timestamp": task.started_at,
+                    "lamport_time": task.lamport_started,
+                })
                 task.last_updated_lamport = self.clock.get_time()
                 changed = True
 
@@ -482,6 +492,13 @@ class Orchestrator:
                 task.completed_worker = worker_id
                 task.completed_at = time.time()
                 task.lamport_completed = self.clock.get_time()
+                # Registrar no histórico de execução
+                task.execution_history.append({
+                    "worker_id": worker_id,
+                    "event": "COMPLETED",
+                    "timestamp": task.completed_at,
+                    "lamport_time": task.lamport_completed,
+                })
                 task.last_updated_lamport = self.clock.get_time()
                 changed = True
 
@@ -515,10 +532,19 @@ class Orchestrator:
             if not is_interrupted:
                 return
 
+            failure_time = time.time()
             task.retries += 1
             task.last_error = reason
             task.failed_workers.append(worker_id)
             task.status = TaskStatus.FAILED.value
+            # Registrar no histórico de execução
+            task.execution_history.append({
+                "worker_id": worker_id,
+                "event": "FAILED",
+                "timestamp": failure_time,
+                "lamport_time": self.clock.get_time(),
+                "reason": reason,
+            })
             task.last_updated_lamport = self.clock.get_time()
 
             if task.retries < self.max_task_retries:
@@ -537,7 +563,7 @@ class Orchestrator:
             self.logger,
             self.clock.tick(),
             "TASK_FAILED",
-            f"Tarefa '{task_id}' falhou no worker '{worker_id}' | motivo={reason}",
+            f"Tarefa '{task_id}' falhou no worker '{worker_id}' | tentativa {self.tasks[task_id].retries}/{self.max_task_retries} | motivo={reason}",
         )
 
         if reassigned:
@@ -545,7 +571,7 @@ class Orchestrator:
                 self.logger,
                 self.clock.tick(),
                 "TASK_REASSIGN",
-                f"Reatribuindo tarefa interrompida '{task_id}' (tentativa {self.tasks[task_id].retries})",
+                f"Reatribuindo automaticamente tarefa interrompida '{task_id}' (tentativa {self.tasks[task_id].retries}/{self.max_task_retries})",
             )
             self._distribute_task(self.tasks[task_id])
 
@@ -616,17 +642,31 @@ class Orchestrator:
         # desde que exista ao menos um worker alternativo disponível.
         failed_set = set(task.failed_workers or [])
         eligible_ids = [wid for wid in active_ids if wid not in failed_set]
-        candidate_ids = eligible_ids if eligible_ids else active_ids
+        
+        if eligible_ids:
+            candidate_ids = eligible_ids
+            selection_reason = f"(workers elegíveis, excluindo {failed_set})"
+        else:
+            candidate_ids = active_ids
+            selection_reason = f"(todas as tentativas falharam, retry global)"
 
         self.rr_index = self.rr_index % len(candidate_ids)
         selected_id = candidate_ids[self.rr_index]
         self.rr_index = (self.rr_index + 1) % len(candidate_ids)
 
+        assign_time = time.time()
         with self._tasks_lock:
             task.status = TaskStatus.ASSIGNED.value
             task.assigned_worker = selected_id
-            task.assigned_at = time.time()
+            task.assigned_at = assign_time
             task.lamport_assigned = self.clock.get_time()
+            # Registrar atribuição no histórico
+            task.execution_history.append({
+                "worker_id": selected_id,
+                "event": "ASSIGNED",
+                "timestamp": assign_time,
+                "lamport_time": task.lamport_assigned,
+            })
             task.last_updated_lamport = self.clock.get_time()
 
         with self._workers_lock:
@@ -660,7 +700,7 @@ class Orchestrator:
                 self.logger,
                 self.clock.get_time(),
                 "TASK_DISTRIBUTED",
-                f"Tarefa '{task.task_id}' -> worker '{selected_id}' (Round Robin idx={self.rr_index})",
+                f"Tarefa '{task.task_id}' -> worker '{selected_id}' {selection_reason}",
             )
             self._sync_state_to_backup()
             return True
@@ -688,11 +728,12 @@ class Orchestrator:
         for task in pending:
             self._distribute_task(task)
 
-    # ==================== HEARTBEAT ====================
+    # ==================== HEARTBEAT DE WORKERS ====================
 
     def _heartbeat_monitor(self):
         heartbeat_timeout = 12
         max_missed_heartbeats = 2
+        activity_timeout = 120
 
         while self.is_running:
             time.sleep(3)
@@ -704,30 +745,81 @@ class Orchestrator:
                     if not winfo.get("active"):
                         continue
 
-                    elapsed = current_time - float(winfo.get("last_heartbeat", 0))
-                    if elapsed <= heartbeat_timeout:
-                        winfo["missed_heartbeats"] = 0
+                    last_hb = float(winfo.get("last_heartbeat", 0))
+                    last_register = float(winfo.get("registered_at", 0))
+                    last_activity = max(last_hb, last_register)
+
+                    elapsed_since_heartbeat = current_time - last_hb
+                    elapsed_since_activity = current_time - last_activity
+
+                    # Se houve atividade recente, reset contagem de heartbeats missed
+                    if elapsed_since_activity < activity_timeout:
+                        if elapsed_since_heartbeat <= heartbeat_timeout:
+                            winfo["missed_heartbeats"] = 0
+                            continue
+                    else:
+                        # Sem atividade recente, considera inativo
+                        to_disconnect.append((wid, f"inativo - sem atividade durante {elapsed_since_activity:.1f}s"))
                         continue
 
+                    # Heartbeat expirou, mas há atividade dentro do timeout
                     missed = int(winfo.get("missed_heartbeats", 0)) + 1
                     winfo["missed_heartbeats"] = missed
+
                     log_event(
                         self.logger,
                         self.clock.tick(),
                         "HEARTBEAT_WARNING",
-                        f"Worker '{wid}' sem heartbeat há {elapsed:.1f}s (tentativa {missed}/{max_missed_heartbeats})",
+                        f"Worker '{wid}' sem heartbeat explícito há {elapsed_since_heartbeat:.1f}s (tentativa {missed}/{max_missed_heartbeats}), última atividade há {elapsed_since_activity:.1f}s",
                     )
-                    if missed >= max_missed_heartbeats:
-                        to_disconnect.append((wid, elapsed))
 
-            for wid, elapsed in to_disconnect:
+                    if missed >= max_missed_heartbeats:
+                        to_disconnect.append((wid, f"heartbeat timeout ({elapsed_since_heartbeat:.1f}s)"))
+
+            for wid, reason in to_disconnect:
                 log_event(
                     self.logger,
                     self.clock.tick(),
-                    "HEARTBEAT_TIMEOUT",
-                    f"Worker '{wid}' considerado inativo após {elapsed:.1f}s sem heartbeat",
+                    "WORKER_TIMEOUT",
+                    f"Worker '{wid}' será desconectado: {reason}",
                 )
-                self._handle_worker_disconnect(wid, reason="heartbeat timeout")
+                self._handle_worker_disconnect(wid, reason=reason)
+
+    # ==================== HEARTBEAT EXPLÍCITO ENTRE ORQUESTRADORES ====================
+
+    def _send_orchestrator_heartbeats(self):
+        """Envia heartbeat periódico ao backup via multicast, separado de STATE_SYNC."""
+        while self.is_running:
+            time.sleep(5)
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+
+                heartbeat_msg = Message(
+                    msg_type=MessageType.ORCHESTRATOR_HEARTBEAT.value,
+                    sender_id=self.node_id,
+                    payload={
+                        "node_id": self.node_id,
+                        "role": self.role,
+                        "timestamp": time.time(),
+                        "active_workers": len([w for w in self.workers.values() if w.get("active")]),
+                        "pending_tasks": len([t for t in self.tasks.values() if t.status == TaskStatus.PENDING.value]),
+                    },
+                    lamport_time=self.clock.send_event(),
+                )
+
+                data = heartbeat_msg.to_bytes()
+                sock.sendto(data, (self.multicast_group, self.multicast_port))
+                self._log_send(heartbeat_msg, f"multicast_heartbeat")
+
+                sock.close()
+            except Exception as e:
+                log_event(
+                    self.logger,
+                    self.clock.tick(),
+                    "HEARTBEAT_SEND_ERROR",
+                    f"Erro ao enviar heartbeat para backup: {e}",
+                )
 
     # ==================== SINCRONIZAÇÃO ====================
 

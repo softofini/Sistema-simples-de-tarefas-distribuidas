@@ -127,7 +127,18 @@ class OrchestratorBackup:
                 msg = Message.from_bytes(data)
                 self.clock.receive_event(msg.lamport_time)
 
-                if msg.msg_type == MessageType.STATE_SYNC.value:
+                if msg.msg_type == MessageType.ORCHESTRATOR_HEARTBEAT.value:
+                    # Heartbeat explícito do primário - sinal de vida separado de STATE_SYNC
+                    self.last_primary_heartbeat = time.time()
+                    self.primary_alive = True
+                    log_event(
+                        self.logger,
+                        self.clock.get_time(),
+                        "PRIMARY_HEARTBEAT",
+                        f"Heartbeat do primário recebido | workers_ativos={msg.payload.get('active_workers', 0)} tasks_pendentes={msg.payload.get('pending_tasks', 0)}",
+                    )
+
+                elif msg.msg_type == MessageType.STATE_SYNC.value:
                     self._update_state(msg.payload)
                     self.last_primary_heartbeat = time.time()
                     self.primary_alive = True
@@ -139,7 +150,7 @@ class OrchestratorBackup:
                         self.logger,
                         self.clock.get_time(),
                         "STATE_SYNCED",
-                        f"Estado sincronizado de {addr} | tarefas={tasks_count} workers={workers_count} sessions={sessions_count}",
+                        f"Estado sincronizado de {addr} | tarefas={tasks_count} workers={workers_count} sessões={sessions_count}",
                     )
 
             except socket.timeout:
@@ -161,34 +172,63 @@ class OrchestratorBackup:
                 "timestamp": state.get("timestamp", 0),
             }
 
-    # ==================== DETECÇÃO DE FALHA ====================
+    # ==================== DETECÇÃO DE FALHA E FAILOVER ====================
 
     def _monitor_primary(self):
-        failover_timeout = 18
+        heartbeat_timeout = 15  # Timeout para heartbeat explícito
+        state_sync_timeout = 20  # Timeout para STATE_SYNC
 
         while self.is_running and not self.is_primary:
             time.sleep(3)
-            elapsed = time.time() - self.last_primary_heartbeat
+            current_time = time.time()
+            elapsed = current_time - self.last_primary_heartbeat
 
-            if elapsed > failover_timeout and self.primary_alive:
+            # Diferencia: heartbeat explícito vs STATE_SYNC
+            if elapsed > heartbeat_timeout:
+                if self.primary_alive:
+                    log_event(
+                        self.logger,
+                        self.clock.tick(),
+                        "PRIMARY_WARNING",
+                        f"Sem heartbeat do primário há {elapsed:.1f}s (tolerância={heartbeat_timeout}s)",
+                    )
+                    self.primary_alive = False
+            elif elapsed > state_sync_timeout:
+                if self.primary_alive:
+                    log_event(
+                        self.logger,
+                        self.clock.tick(),
+                        "STATE_SYNC_WARNING",
+                        f"Sem STATE_SYNC há {elapsed:.1f}s (heartbeat ainda ativo, sincronização lenta)",
+                    )
+
+            # Dispara failover apenas após timeout do heartbeat explícito
+            if elapsed > heartbeat_timeout and self.primary_alive:
                 log_event(
                     self.logger,
                     self.clock.tick(),
                     "PRIMARY_FAILURE",
-                    f"Primário sem sincronização há {elapsed:.1f}s",
+                    f"Primário considerado falho - sem heartbeat há {elapsed:.1f}s",
                 )
-                log_event(self.logger, self.clock.tick(), "FAILOVER_ACTIVATE", "Backup assumindo como primário")
+                log_event(
+                    self.logger,
+                    self.clock.tick(),
+                    "FAILOVER_INITIATE",
+                    "Inicializando failover - backup assumindo como primário",
+                )
                 self.primary_alive = False
                 self.is_primary = True
                 break
 
-            if elapsed > failover_timeout / 2:
+            # Recuperação: se heartbeat retornar
+            if elapsed < heartbeat_timeout and not self.primary_alive:
                 log_event(
                     self.logger,
                     self.clock.tick(),
-                    "PRIMARY_WARNING",
-                    f"Sem sincronização do primário há {elapsed:.1f}s (timeout={failover_timeout}s)",
+                    "PRIMARY_RECOVERY",
+                    f"Heartbeat do primário restaurado",
                 )
+                self.primary_alive = True
 
     # ==================== REDIRECIONAMENTO PASSIVO ====================
 
@@ -285,6 +325,7 @@ class OrchestratorBackup:
 
         with self._state_lock:
             new_orchestrator.restore_replicated_state(self.replicated_state)
+            self._perform_recovery_routine(new_orchestrator)
 
         log_event(
             self.logger,
@@ -298,6 +339,101 @@ class OrchestratorBackup:
 
         # O próprio orquestrador ativo continuará publicando estado atualizado no multicast.
         new_orchestrator.start()
+
+    def _perform_recovery_routine(self, orchestrator):
+        """
+        Rotina de recuperação pós-failover:
+        - Aguarda reconexão breve dos workers (10s)
+        - Reatribui tarefas realmente interrompidas
+        """
+        from utils.protocol import TaskStatus
+        
+        log_event(
+            self.logger,
+            self.clock.tick(),
+            "RECOVERY_START",
+            "Iniciando rotina de recuperação pós-failover",
+        )
+
+        # Marcar workers que estavam ativos como inativos inicialmente
+        with orchestrator._workers_lock:
+            for wid, winfo in orchestrator.workers.items():
+                winfo["active"] = False
+                winfo["load"] = 0
+                log_event(
+                    self.logger,
+                    self.clock.get_time(),
+                    "RECOVERY_WORKER_RESET",
+                    f"Worker '{wid}' marcado como inativo para reconnect",
+                )
+
+        # Aguardar 10s for worker reconnections
+        recovery_wait_time = 10
+        log_event(
+            self.logger,
+            self.clock.tick(),
+            "RECOVERY_WAIT",
+            f"Aguardando reconexão de workers ({recovery_wait_time}s)...",
+        )
+        
+        for i in range(recovery_wait_time):
+            time.sleep(1)
+            # Podia check a cada segundo quantos workers se reconectaram
+            with orchestrator._workers_lock:
+                active_count = len([w for w in orchestrator.workers.values() if w.get("active")])
+            if i % 3 == 0:
+                log_event(
+                    self.logger,
+                    self.clock.get_time(),
+                    "RECOVERY_PROGRESS",
+                    f"Reconexão em progresso... {active_count} workers ativos",
+                )
+
+        # Após espera, reatribuir tarefas ainda interrompidas
+        log_event(
+            self.logger,
+            self.clock.tick(),
+            "RECOVERY_REASSIGN",
+            "Reatribuindo tarefas interrompidas",
+        )
+
+        with orchestrator._tasks_lock:
+            interrupted_tasks = []
+            for task in orchestrator.tasks.values():
+                # Tarefas que estavam ASSIGNED ou RUNNING são candidatas
+                if task.status in [TaskStatus.ASSIGNED.value, TaskStatus.RUNNING.value]:
+                    # Verificar se o worker designado ainda está ativo
+                    with orchestrator._workers_lock:
+                        worker = orchestrator.workers.get(task.assigned_worker)
+                        if not worker or not worker.get("active"):
+                            interrupted_tasks.append(task)
+                            log_event(
+                                self.logger,
+                                self.clock.get_time(),
+                                "RECOVERY_TASK",
+                                f"Tarefa '{task.task_id}' interrompida (worker '{task.assigned_worker}' não respondeu)",
+                            )
+
+        # Reatribuir tarefas interrompidas
+        for task in interrupted_tasks:
+            task.status = TaskStatus.PENDING.value
+            task.assigned_worker = None
+            task.assigned_at = 0.0
+            task.started_at = 0.0
+            log_event(
+                self.logger,
+                self.clock.tick(),
+                "RECOVERY_REASSIGN_TASK",
+                f"Tarefa '{task.task_id}' marcada para reatribuição automática",
+            )
+            orchestrator._distribute_task(task)
+
+        log_event(
+            self.logger,
+            self.clock.tick(),
+            "RECOVERY_COMPLETE",
+            f"Rotina de recuperação concluída | {len(interrupted_tasks)} tarefas reatribuídas",
+        )
 
     def _select_failover_ports(self) -> Tuple[int, int]:
         preferred = (self.primary_client_port, self.primary_worker_port)

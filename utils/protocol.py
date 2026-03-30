@@ -22,28 +22,25 @@ class MessageType(Enum):
     TASK_SUBMIT = "TASK_SUBMIT"
     TASK_SUBMIT_ACK = "TASK_SUBMIT_ACK"
     TASK_ASSIGN = "TASK_ASSIGN"
-    TASK_ASSIGN_ACK = "TASK_ASSIGN_ACK"
     TASK_STARTED = "TASK_STARTED"
     TASK_STATUS_REQUEST = "TASK_STATUS_REQUEST"
     TASK_STATUS_RESPONSE = "TASK_STATUS_RESPONSE"
     TASK_COMPLETE = "TASK_COMPLETE"
     TASK_FAILED = "TASK_FAILED"
-    TASK_REASSIGN = "TASK_REASSIGN"
     REDIRECT = "REDIRECT"
 
     # Heartbeat
     HEARTBEAT = "HEARTBEAT"
     HEARTBEAT_ACK = "HEARTBEAT_ACK"
+    ORCHESTRATOR_HEARTBEAT = "ORCHESTRATOR_HEARTBEAT"
 
     # Sincronização Orquestrador ↔ Backup
     STATE_SYNC = "STATE_SYNC"
-    STATE_SYNC_ACK = "STATE_SYNC_ACK"
     FAILOVER_ACTIVATE = "FAILOVER_ACTIVATE"
 
     # Worker
     WORKER_REGISTER = "WORKER_REGISTER"
     WORKER_REGISTER_ACK = "WORKER_REGISTER_ACK"
-    WORKER_STATUS = "WORKER_STATUS"
 
     # Simulação de falha
     SIMULATE_FAILURE = "SIMULATE_FAILURE"
@@ -103,6 +100,8 @@ class Task:
     lamport_completed: int = 0
     last_updated_lamport: int = 0
     retries: int = 0
+    # Histórico completo de execução: lista de tentativas com worker, timestamps e Lamport time
+    execution_history: list = field(default_factory=list)  # [{"worker_id": str, "event": str, "timestamp": float, "lamport_time": int}]
 
     def to_dict(self) -> dict:
         return asdict(self)
