@@ -48,44 +48,48 @@ O sistema é composto por quatro tipos de componentes:
 ## 🚀 Instalação e Execução
 
 ### 1. Clonar o repositório
-```bash
+```powershell
 git clone https://github.com/seu-usuario/plataforma-distribuida.git
 cd plataforma-distribuida
 ```
 
-### 2. Iniciar o sistema completo (script automático)
-```bash
-chmod +x start_system.sh
-./start_system.sh
+### 2. Iniciar componentes individualmente (Windows)
+
+> **No Windows, cada componente deve ser iniciado em uma janela separada do PowerShell ou Prompt de Comando (CMD).** use os comandos abaixo.
+
+**Janela 1 - Orquestrador Principal:**
+```powershell
+python orchestrator\orchestrator.py --host 0.0.0.0 --client-port 5000 --worker-port 5001
 ```
 
-### 3. Ou iniciar componentes individualmente
-
-**Terminal 1 - Orquestrador Principal:**
-```bash
-python3 orchestrator/orchestrator.py --host 0.0.0.0 --client-port 5000 --worker-port 5001
+**Janela 2 - Orquestrador Backup:**
+```powershell
+python orchestrator\backup.py --host 0.0.0.0 --client-port 6000 --worker-port 6001
 ```
 
-**Terminal 2 - Orquestrador Backup:**
-```bash
-python3 orchestrator/backup.py --host 0.0.0.0 --client-port 6000 --worker-port 6001
+**Janela 3 - Worker 1:**
+```powershell
+python worker\worker.py --id worker_1 --host 127.0.0.1 --port 5001
 ```
 
-**Terminais 3, 4, 5 - Workers:**
-```bash
-python3 worker/worker.py --id worker_1 --host 127.0.0.1 --port 5001
-python3 worker/worker.py --id worker_2 --host 127.0.0.1 --port 5001
-python3 worker/worker.py --id worker_3 --host 127.0.0.1 --port 5001 --simulate-failure
+**Janela 4 - Worker 2:**
+```powershell
+python worker\worker.py --id worker_2 --host 127.0.0.1 --port 5001
 ```
 
-**Terminal 6 - Cliente Interativo:**
-```bash
-python3 client/client.py --interactive
+**Janela 5 - Worker 3 (com falhas simuladas):**
+```powershell
+python worker\worker.py --id worker_3 --host 127.0.0.1 --port 5001 --simulate-failure --failure-prob 0.3
 ```
 
-### 4. Executar testes automatizados
-```bash
-python3 test_system.py
+**Janela 6 - Cliente Interativo:**
+```powershell
+python client\client.py --interactive
+```
+
+### 3. Executar testes automatizados
+```powershell
+python test_system.py
 ```
 
 ---
@@ -167,7 +171,6 @@ plataforma-distribuida/
 │   └── logger.py                # Sistema de logs
 ├── logs/                        # Arquivos de log
 ├── test_system.py               # Testes automatizados
-├── start_system.sh              # Script de inicialização
 └── README.md                    # Este arquivo
 ```
 
