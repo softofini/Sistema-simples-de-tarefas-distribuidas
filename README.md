@@ -83,6 +83,8 @@ python test_system.py
 
 Valida autenticação, submissão, processamento, tolerância a falha de worker, reatribuição e `execution_history`.
 
+Também valida failover real do orquestrador principal (encerrando o primário durante o teste), promoção automática do backup e continuidade operacional com submissão/consulta de tarefas após o failover.
+
 2. Teste rápido:
 
 ```powershell
@@ -96,6 +98,7 @@ python test_quick.py
 - Ao assumir, tenta primeiro bind nas portas do primário (`5000/5001`).
 - Se as portas estiverem ocupadas, permanece em `6000/6001` (clientes/workers com suporte a redirect continuam operando).
 - Após assumir, executa rotina de recuperação para reatribuir tarefas interrompidas.
+- Durante a janela de failover, podem ocorrer erros transitórios de conexão no Windows (ex.: `WinError 10053`), comportamento esperado até a promoção completa do backup.
 
 ## Usuários Padrão
 
@@ -139,9 +142,6 @@ Sistema-simples-de-tarefas-distribuidas/
 │   └── worker.py
 ├── test_quick.py
 ├── test_system.py
-├── IMPROVEMENTS_SUMMARY.md
-├── IMPLEMENTATION_DETAILS.md
-├── USAGE_GUIDE.md
 └── README.md
 ```
 

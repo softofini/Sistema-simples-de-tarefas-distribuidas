@@ -66,6 +66,57 @@ def recv_msg(conn, timeout=10):
         conn.settimeout(None)
 
 
+def send_request_with_failover(msg, endpoints, total_timeout=35, per_attempt_timeout=3):
+    """
+    Envia uma requisição tentando múltiplos endpoints (primário/backup).
+    Suporta resposta REDIRECT durante janela de failover.
+    """
+    deadline = time.time() + total_timeout
+    # Copia lista para permitir repriorização por REDIRECT
+    endpoint_list = list(endpoints)
+
+    while time.time() < deadline:
+        for host, port in list(endpoint_list):
+            conn = None
+            try:
+                conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                conn.settimeout(per_attempt_timeout)
+                conn.connect((host, port))
+
+                if not send_msg(conn, msg.to_json()):
+                    continue
+
+                resp_raw = recv_msg(conn, timeout=per_attempt_timeout)
+                if not resp_raw:
+                    continue
+
+                resp_msg = Message.from_json(resp_raw)
+                if resp_msg.msg_type == MessageType.REDIRECT.value:
+                    redirect_host = resp_msg.payload.get("host")
+                    redirect_port = int(resp_msg.payload.get("port", 0) or 0)
+                    if redirect_host and redirect_port:
+                        redirect_endpoint = (redirect_host, redirect_port)
+                        if redirect_endpoint in endpoint_list:
+                            endpoint_list.remove(redirect_endpoint)
+                        endpoint_list.insert(0, redirect_endpoint)
+                    continue
+
+                return resp_msg, (host, port), endpoint_list
+
+            except Exception:
+                continue
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        time.sleep(1)
+
+    return None, None, endpoint_list
+
+
 def test_full_scenario():
     """Executa o cenário completo de testes."""
     print("=" * 80)
@@ -292,6 +343,119 @@ def test_full_scenario():
         if history_valid > 0:
             print(f"  ✓ Histórico de execução: {history_valid} tarefas com registro completo")
 
+        # ========== FASE 8: Failover real do orquestrador ==========
+        print(f"\n[FASE 8] Testando failover real do orquestrador principal...")
+        print("  → Encerrando orquestrador principal...")
+        orch_proc.terminate()
+        try:
+            orch_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            orch_proc.kill()
+        print("  ✓ Orquestrador principal encerrado")
+
+        # Fecha conexão antiga para forçar novo fluxo de conexão
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+        # Janela para failover: timeout heartbeat (15s) + loop monitor (3s) + margem
+        print("  → Aguardando promoção do backup e reconexão automática (até 35s)...")
+
+        active_endpoints = [("127.0.0.1", 5000), ("127.0.0.1", 6000)]
+
+        status_after_failover_msg = Message(
+            msg_type=MessageType.TASK_STATUS_REQUEST.value,
+            sender_id="test_client",
+            payload={},
+            lamport_time=clock.send_event(),
+            token=token,
+        )
+
+        failover_resp, active_endpoint, active_endpoints = send_request_with_failover(
+            status_after_failover_msg,
+            active_endpoints,
+            total_timeout=35,
+            per_attempt_timeout=3,
+        )
+
+        assert failover_resp is not None, "Failover não completou dentro do tempo esperado"
+        clock.receive_event(failover_resp.lamport_time)
+        assert failover_resp.payload.get("success"), "Consulta após failover falhou"
+        print(f"  ✓ Backup ativo respondeu em {active_endpoint[0]}:{active_endpoint[1]}")
+
+        # Submeter tarefas após failover para validar continuidade operacional
+        print("  → Submetendo tarefas pós-failover...")
+        post_failover_ids = []
+        for i in range(2):
+            submit_after_failover_msg = Message(
+                msg_type=MessageType.TASK_SUBMIT.value,
+                sender_id="test_client",
+                payload={"description": f"Tarefa pós-failover #{i+1}"},
+                lamport_time=clock.send_event(),
+                token=token,
+            )
+            submit_resp, submit_endpoint, active_endpoints = send_request_with_failover(
+                submit_after_failover_msg,
+                active_endpoints,
+                total_timeout=20,
+                per_attempt_timeout=3,
+            )
+            assert submit_resp is not None, "Sem resposta ao submeter tarefa pós-failover"
+            clock.receive_event(submit_resp.lamport_time)
+            assert submit_resp.payload.get("success"), "Falha ao submeter tarefa pós-failover"
+            pf_id = submit_resp.payload.get("task_id")
+            post_failover_ids.append(pf_id)
+            print(f"    ✓ Tarefa pós-failover #{i+1}: ID={pf_id} via {submit_endpoint[0]}:{submit_endpoint[1]}")
+            time.sleep(0.3)
+
+        print("  → Aguardando conclusão das tarefas pós-failover (até 45s)...")
+        wait_deadline = time.time() + 45
+        post_failover_completed = 0
+        tasks_final_post_failover = []
+
+        while time.time() < wait_deadline:
+            final_status_msg = Message(
+                msg_type=MessageType.TASK_STATUS_REQUEST.value,
+                sender_id="test_client",
+                payload={},
+                lamport_time=clock.send_event(),
+                token=token,
+            )
+            final_resp, _, active_endpoints = send_request_with_failover(
+                final_status_msg,
+                active_endpoints,
+                total_timeout=8,
+                per_attempt_timeout=3,
+            )
+
+            if final_resp is None or not final_resp.payload.get("success"):
+                time.sleep(1)
+                continue
+
+            clock.receive_event(final_resp.lamport_time)
+            tasks_final_post_failover = final_resp.payload.get("tasks", [])
+            post_failover_status = {
+                t.get("task_id"): t.get("status")
+                for t in tasks_final_post_failover
+                if t.get("task_id") in post_failover_ids
+            }
+            post_failover_completed = sum(
+                1
+                for tid in post_failover_ids
+                if post_failover_status.get(tid) == TaskStatus.COMPLETED.value
+            )
+
+            print(f"    → Progresso pós-failover: {post_failover_completed}/{len(post_failover_ids)} concluídas")
+
+            if post_failover_completed == len(post_failover_ids):
+                break
+
+            time.sleep(2)
+
+        print(f"  ✓ Tarefas pós-failover concluídas: {post_failover_completed}/{len(post_failover_ids)}")
+        assert post_failover_completed == len(post_failover_ids), "Nem todas as tarefas pós-failover foram concluídas no tempo esperado"
+
         # ========== RESULTADO FINAL ==========
         print("\n" + "=" * 80)
         print(" RESUMO DOS TESTES")
@@ -303,6 +467,8 @@ def test_full_scenario():
         print("  ✓ Consulta de status com histórico de execução")
         print("  ✓ Tolerância a falha de worker")
         print("  ✓ Reatribuição automática de tarefas interrompidas")
+        print("  ✓ Failover real do orquestrador principal")
+        print("  ✓ Continuidade operacional após failover")
         print("  ✓ Relógio lógico de Lamport")
         print("  ✓ Sincronização multicast com backup")
         print("  ✓ Heartbeat explícito entre orquestradores")
@@ -310,15 +476,20 @@ def test_full_scenario():
             print("  ✓ Rastreamento completo de histórico de execução")
         
         print(f"\n  ESTATÍSTICAS FINAIS:")
-        print(f"  • Total de tarefas: {len(tasks_final)}")
-        print(f"  • Tarefas concluídas: {completed_final}")
-        print(f"  • Taxa de sucesso: {100*completed_final/max(1,len(tasks_final)):.1f}%")
+        total_tasks = len(tasks_final_post_failover)
+        total_completed = sum(1 for t in tasks_final_post_failover if t.get('status') == TaskStatus.COMPLETED.value)
+        print(f"  • Total de tarefas: {total_tasks}")
+        print(f"  • Tarefas concluídas: {total_completed}")
+        print(f"  • Taxa de sucesso: {100*total_completed/max(1,total_tasks):.1f}%")
         
         print("\n" + "=" * 80)
         print(" TODOS OS TESTES PASSARAM COM SUCESSO!")
         print("=" * 80)
 
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
         return 0
 
     except KeyboardInterrupt:

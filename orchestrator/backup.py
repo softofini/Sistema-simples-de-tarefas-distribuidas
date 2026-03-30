@@ -176,14 +176,14 @@ class OrchestratorBackup:
 
     def _monitor_primary(self):
         heartbeat_timeout = 15  # Timeout para heartbeat explícito
-        state_sync_timeout = 20  # Timeout para STATE_SYNC
 
         while self.is_running and not self.is_primary:
             time.sleep(3)
             current_time = time.time()
             elapsed = current_time - self.last_primary_heartbeat
 
-            # Diferencia: heartbeat explícito vs STATE_SYNC
+            # Dispara failover após expirar heartbeat explícito.
+            # A promoção ocorre no mesmo ramo para evitar bloqueio por estado intermediário.
             if elapsed > heartbeat_timeout:
                 if self.primary_alive:
                     log_event(
@@ -192,33 +192,21 @@ class OrchestratorBackup:
                         "PRIMARY_WARNING",
                         f"Sem heartbeat do primário há {elapsed:.1f}s (tolerância={heartbeat_timeout}s)",
                     )
-                    self.primary_alive = False
-            elif elapsed > state_sync_timeout:
-                if self.primary_alive:
                     log_event(
                         self.logger,
                         self.clock.tick(),
-                        "STATE_SYNC_WARNING",
-                        f"Sem STATE_SYNC há {elapsed:.1f}s (heartbeat ainda ativo, sincronização lenta)",
+                        "PRIMARY_FAILURE",
+                        f"Primário considerado falho - sem heartbeat há {elapsed:.1f}s",
                     )
-
-            # Dispara failover apenas após timeout do heartbeat explícito
-            if elapsed > heartbeat_timeout and self.primary_alive:
-                log_event(
-                    self.logger,
-                    self.clock.tick(),
-                    "PRIMARY_FAILURE",
-                    f"Primário considerado falho - sem heartbeat há {elapsed:.1f}s",
-                )
-                log_event(
-                    self.logger,
-                    self.clock.tick(),
-                    "FAILOVER_INITIATE",
-                    "Inicializando failover - backup assumindo como primário",
-                )
-                self.primary_alive = False
-                self.is_primary = True
-                break
+                    log_event(
+                        self.logger,
+                        self.clock.tick(),
+                        "FAILOVER_INITIATE",
+                        "Inicializando failover - backup assumindo como primário",
+                    )
+                    self.primary_alive = False
+                    self.is_primary = True
+                    break
 
             # Recuperação: se heartbeat retornar
             if elapsed < heartbeat_timeout and not self.primary_alive:
