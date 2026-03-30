@@ -6,6 +6,8 @@ Define o formato de mensagens trocadas entre todos os componentes.
 import json
 import hashlib
 import secrets
+import threading
+import time
 from enum import Enum
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any
@@ -21,11 +23,13 @@ class MessageType(Enum):
     TASK_SUBMIT_ACK = "TASK_SUBMIT_ACK"
     TASK_ASSIGN = "TASK_ASSIGN"
     TASK_ASSIGN_ACK = "TASK_ASSIGN_ACK"
+    TASK_STARTED = "TASK_STARTED"
     TASK_STATUS_REQUEST = "TASK_STATUS_REQUEST"
     TASK_STATUS_RESPONSE = "TASK_STATUS_RESPONSE"
     TASK_COMPLETE = "TASK_COMPLETE"
     TASK_FAILED = "TASK_FAILED"
     TASK_REASSIGN = "TASK_REASSIGN"
+    REDIRECT = "REDIRECT"
 
     # Heartbeat
     HEARTBEAT = "HEARTBEAT"
@@ -51,7 +55,6 @@ class TaskStatus(Enum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
-    REASSIGNED = "REASSIGNED"
 
 
 @dataclass
@@ -85,11 +88,20 @@ class Task:
     description: str
     status: str = TaskStatus.PENDING.value
     assigned_worker: Optional[str] = None
+    first_started_worker: Optional[str] = None
+    completed_worker: Optional[str] = None
+    failed_workers: list = field(default_factory=list)
     result: Optional[str] = None
+    last_error: Optional[str] = None
     created_at: float = 0.0
+    assigned_at: float = 0.0
+    started_at: float = 0.0
     completed_at: float = 0.0
     lamport_created: int = 0
+    lamport_assigned: int = 0
+    lamport_started: int = 0
     lamport_completed: int = 0
+    last_updated_lamport: int = 0
     retries: int = 0
 
     def to_dict(self) -> dict:
@@ -101,12 +113,13 @@ class Task:
 
 
 class AuthManager:
-    """Gerenciador de autenticação simples com tokens."""
+    """Gerenciador de autenticação com sessões replicáveis."""
 
-    def __init__(self):
+    def __init__(self, token_ttl_seconds: int = 3600):
         # Banco de usuários simulado (usuário: hash da senha)
         self.users: Dict[str, str] = {}
-        self.tokens: Dict[str, str] = {}  # token -> username
+        self.tokens: Dict[str, Dict[str, Any]] = {}
+        self.token_ttl_seconds = token_ttl_seconds
         self._lock = threading.Lock()
 
         # Registrar usuários padrão
@@ -124,19 +137,62 @@ class AuthManager:
         pw_hash = hashlib.sha256(password.encode()).hexdigest()
         if username in self.users and self.users[username] == pw_hash:
             token = secrets.token_hex(16)
+            now = time.time()
             with self._lock:
-                self.tokens[token] = username
+                self.tokens[token] = {
+                    "username": username,
+                    "issued_at": now,
+                    "last_seen": now,
+                    "expires_at": now + self.token_ttl_seconds,
+                }
             return token
         return None
 
     def validate_token(self, token: str) -> Optional[str]:
         """Valida um token e retorna o username ou None."""
         with self._lock:
-            return self.tokens.get(token)
+            session = self.tokens.get(token)
+            if not session:
+                return None
+
+            now = time.time()
+            if now >= float(session.get("expires_at", 0)):
+                self.tokens.pop(token, None)
+                return None
+
+            session["last_seen"] = now
+            return session.get("username")
+
+    def touch_token(self, token: str):
+        """Atualiza metadados de uso da sessão sem alterar validade."""
+        with self._lock:
+            session = self.tokens.get(token)
+            if session:
+                session["last_seen"] = time.time()
 
     def revoke_token(self, token: str):
         with self._lock:
             self.tokens.pop(token, None)
 
+    def export_state(self) -> Dict[str, Any]:
+        """Serializa sessões autenticadas para replicação."""
+        with self._lock:
+            return {
+                "tokens": {k: dict(v) for k, v in self.tokens.items()},
+                "token_ttl_seconds": self.token_ttl_seconds,
+            }
 
-import threading
+    def import_state(self, state: Dict[str, Any]):
+        """Restaura sessões autenticadas replicadas do primário."""
+        tokens = state.get("tokens", {}) if state else {}
+        ttl = state.get("token_ttl_seconds", self.token_ttl_seconds) if state else self.token_ttl_seconds
+        with self._lock:
+            self.token_ttl_seconds = int(ttl)
+            self.tokens = {}
+            for token, session in tokens.items():
+                self.tokens[token] = {
+                    "username": session.get("username"),
+                    "issued_at": float(session.get("issued_at", time.time())),
+                    "last_seen": float(session.get("last_seen", time.time())),
+                    "expires_at": float(session.get("expires_at", time.time() + self.token_ttl_seconds)),
+                }

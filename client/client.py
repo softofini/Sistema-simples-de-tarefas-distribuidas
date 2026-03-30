@@ -49,6 +49,10 @@ class Client:
                     pass
             self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.conn.connect((host, port))
+            # Backup passivo pode responder com REDIRECT imediatamente.
+            redirected = self._consume_redirect_if_any()
+            if redirected:
+                return False
             return True
         except (ConnectionRefusedError, OSError):
             return False
@@ -80,8 +84,6 @@ class Client:
                     log_event(self.logger, self.clock.tick(), "RECONNECTED",
                               f"Reconectado ao orquestrador em {host}:{port}")
                     print(f"\n[!] Reconectado ao orquestrador em {host}:{port}")
-                    if self._username and self._password:
-                        return self.authenticate(self._username, self._password)
                     return True
             time.sleep(retry_interval)
 
@@ -117,6 +119,15 @@ class Client:
             return False
 
         response = Message.from_json(data)
+        if response.msg_type == MessageType.REDIRECT.value:
+            host = response.payload.get("host")
+            port = response.payload.get("port")
+            if host and port:
+                self.orchestrator_host = host
+                self.orchestrator_port = int(port)
+                if self._try_reconnect(timeout_seconds=8, retry_interval=0.5):
+                    return self.authenticate(username, password)
+            return False
         self.clock.receive_event(response.lamport_time)
 
         if response.payload.get("success"):
@@ -201,7 +212,69 @@ class Client:
             if not self._send_message(msg.to_json()):
                 return None
             data = self._recv_message()
+        if data is None:
+            return None
+
+        parsed = Message.from_json(data)
+        if parsed.msg_type == MessageType.REDIRECT.value:
+            host = parsed.payload.get("host")
+            port = parsed.payload.get("port")
+            if host and port:
+                self.orchestrator_host = host
+                self.orchestrator_port = int(port)
+                if not self._try_reconnect(timeout_seconds=8, retry_interval=0.5):
+                    return None
+                msg.token = self.token
+                if not self._send_message(msg.to_json()):
+                    return None
+                data = self._recv_message()
         return data
+
+    def _consume_redirect_if_any(self) -> bool:
+        """Detecta redirecionamento imediato enviado por backup passivo."""
+        if not self.conn:
+            return False
+
+        try:
+            self.conn.settimeout(0.25)
+            data = self._recv_message()
+        except Exception:
+            return False
+        finally:
+            try:
+                self.conn.settimeout(None)
+            except Exception:
+                pass
+
+        if not data:
+            return False
+
+        try:
+            msg = Message.from_json(data)
+        except Exception:
+            return False
+
+        if msg.msg_type != MessageType.REDIRECT.value:
+            return False
+
+        self.clock.receive_event(msg.lamport_time)
+        host = msg.payload.get("host")
+        port = msg.payload.get("port")
+        if host and port:
+            self.orchestrator_host = host
+            self.orchestrator_port = int(port)
+            log_event(
+                self.logger,
+                self.clock.tick(),
+                "REDIRECT_RECEIVED",
+                f"Redirecionamento automático para {host}:{port}",
+            )
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = None
+        return True
 
     def _send_message(self, data: str) -> bool:
         try:
@@ -292,11 +365,21 @@ def interactive_client():
             if result.get("success"):
                 tasks = result.get("tasks", [])
                 if tasks:
-                    print(f"\n{'ID':<12} {'Status':<12} {'Worker':<12} {'Descrição'}")
-                    print("-" * 60)
+                    print(
+                        f"\n{'ID':<12} {'Status':<11} {'Em execução por':<16} "
+                        f"{'Falhou em':<18} {'Concluída por':<14} {'Descrição'}"
+                    )
+                    print("-" * 110)
                     for t in tasks:
-                        print(f"{t['task_id']:<12} {t['status']:<12} "
-                              f"{t.get('assigned_worker', 'N/A'):<12} {t['description']}")
+                        failed_workers = t.get('failed_workers', [])
+                        unique_failed_workers = list(dict.fromkeys(failed_workers))
+                        failed_text = ",".join(unique_failed_workers) if unique_failed_workers else "N/A"
+                        started_by = t.get('first_started_worker') or t.get('assigned_worker') or 'N/A'
+                        completed_by = t.get('completed_worker') or 'N/A'
+                        print(
+                            f"{t['task_id']:<12} {t['status']:<11} {started_by:<16} "
+                            f"{failed_text:<18} {completed_by:<14} {t['description']}"
+                        )
                 else:
                     print("\nNenhuma tarefa encontrada.")
             else:

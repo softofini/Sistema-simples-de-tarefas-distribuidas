@@ -43,9 +43,12 @@ def setup_logger(name: str, log_dir: str = "logs") -> logging.Logger:
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
-    # Handler para console
+    # Handler para console.
+    # Quando stdout não é TTY (ex.: testes com subprocess.PIPE),
+    # reduzimos verbosidade para evitar bloquear o processo por buffer cheio.
+    console_level = logging.INFO if sys.stdout.isatty() else logging.WARNING
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(console_level)
     console_handler.setFormatter(formatter)
 
     logger.addHandler(file_handler)

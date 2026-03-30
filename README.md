@@ -49,8 +49,8 @@ O sistema é composto por quatro tipos de componentes:
 
 ### 1. Clonar o repositório
 ```powershell
-git clone https://github.com/seu-usuario/plataforma-distribuida.git
-cd plataforma-distribuida
+git clone https://github.com/softofini/Sistema-simples-de-tarefas-distribuidas.git
+cd Sistema-simples-de-tarefas-distribuidas
 ```
 
 ### 2. Iniciar componentes individualmente (Windows)
@@ -64,22 +64,22 @@ python orchestrator\orchestrator.py --host 0.0.0.0 --client-port 5000 --worker-p
 
 **Janela 2 - Orquestrador Backup:**
 ```powershell
-python orchestrator\backup.py --host 0.0.0.0 --client-port 6000 --worker-port 6001
+python orchestrator\backup.py --host 0.0.0.0 --client-port 6000 --worker-port 6001 --primary-host 127.0.0.1 --primary-client-port 5000 --primary-worker-port 5001
 ```
 
 **Janela 3 - Worker 1:**
 ```powershell
-python worker\worker.py --id worker_1 --host 127.0.0.1 --port 5001
+python worker\worker.py --id worker_1 --host 127.0.0.1 --port 5001 --secondary-host 127.0.0.1 --secondary-port 6001
 ```
 
 **Janela 4 - Worker 2:**
 ```powershell
-python worker\worker.py --id worker_2 --host 127.0.0.1 --port 5001
+python worker\worker.py --id worker_2 --host 127.0.0.1 --port 5001 --secondary-host 127.0.0.1 --secondary-port 6001
 ```
 
 **Janela 5 - Worker 3 (com falhas simuladas):**
 ```powershell
-python worker\worker.py --id worker_3 --host 127.0.0.1 --port 5001 --simulate-failure --failure-prob 0.3
+python worker\worker.py --id worker_3 --host 127.0.0.1 --port 5001 --secondary-host 127.0.0.1 --secondary-port 6001 --simulate-failure --failure-prob 0.3
 ```
 
 **Janela 6 - Cliente Interativo:**
